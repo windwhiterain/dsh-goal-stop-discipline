@@ -205,7 +205,7 @@ false, that a scope with the question tool but no goal tool still gets it, and e
 value:
 
 ```sh
-node C:/resource/dsh-goal-stop-discipline/probe.mjs
+node probe.mjs
 ```
 
 ## Install
@@ -217,17 +217,26 @@ The package is a bundle: it ships a patch file that inserts one row, declared th
 dsh plugin   # or the Web plugin manager, with the spec below
 ```
 
-Use `link:C:/resource/dsh-goal-stop-discipline` as the install spec, then restart the host if the
-profile manager reports `restart-required`.
+Use the package name as the install spec:
+
+```
+windwhiterain/dsh-goal-stop-discipline
+```
+
+then restart the host if the profile manager reports `restart-required`. Working on the row itself,
+install it from a checkout instead — `link:/path/to/dsh-goal-stop-discipline` — so the profile
+resolves your working copy rather than the registry copy.
 
 An installed row edits as any other local plugin only when the profile lists its file as an `hmr`
 root: Node caches an imported module by URL, and a plain patch reload reuses that cached module.
+Without that root, editing `index.js` re-reads the patch and reloads the *cached* module, so a change
+never reaches the running host.
 
 ## Files
 
 | File | Role |
 |---|---|
-| `index.js` | The row: config validation, active-goal tracking, the section, the notice, and the tool mask |
+| `index.js` | The row: config validation, active-goal tracking, the section, the notice, the tool mask, and the ask rule |
 | `cordis.patch.yml` | The whole package: one inserted row with its config |
 | `package.json` | Bundle manifest (`dsh.bundle.patch`) and the row's export |
-| `probe.mjs` | Offline probe over all three contributions |
+| `probe.mjs` | Offline probe over all four contributions |
