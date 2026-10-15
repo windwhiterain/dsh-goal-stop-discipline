@@ -1,0 +1,32 @@
+# dsh-goal-stop-discipline bundle patch: inserts the discipline row.
+#
+# `goalToolsOnDemand` masks get_goal / create_goal / update_goal on every agent
+# until that agent holds an active goal, then releases the mask as soon as one
+# exists. That needs the tools to be published by the composition in the first
+# place: a preset that mounts no goal tool has nothing to mask. Set
+# `goalToolsOnDemand` to false to leave tool visibility to the composition.
+#
+# `policyText` renders while the assembling agent holds an active goal, and
+# `roundNoticeText` is appended to the first step of every goal round; each has a
+# `...WithoutGoalTools` variant for a preset that publishes none. Set
+# `policyEnabled` or `roundNoticeEnabled` to false to drop one half of the row.
+#
+# `askEnabled` appends the ask rule — call `ask_user_question` and wait for the
+# answer instead of writing a question into the message, where the user never
+# sees it and the next round starts without it — to whichever text the scope
+# gets. It is appended only to a scope that can actually call `ask_user_question`,
+# so a preset that mounts no question tool is told nothing about asking. It rides
+# in the same notice message and paragraph, so it costs no extra message. Set
+# `askEnabled` to false to drop it.
+#
+# Every text is plain model-facing text: write them as instructions to the agent,
+# and keep any house rule that belongs with them here rather than in the row's
+# code.
+- insert:
+    - id: goal-stop-discipline
+      name: 'dsh-goal-stop-discipline'
+      config:
+        goalToolsOnDemand: true
+        policyEnabled: true
+        roundNoticeEnabled: true
+        askEnabled: true
