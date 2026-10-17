@@ -30,6 +30,13 @@
 # verbatim below the compacted prefix. Set `compactEnabled` to false to drop both
 # the tool and the nudge.
 #
+# `compactGaugeEnabled` prepends the measured context gauge to that nudge, so the
+# model reads the used, window, remaining, and percent numbers instead of
+# guessing. `compactGaugeText` is the template and must contain `{used}`,
+# `{window}`, `{remaining}`, and `{percent}`. A route whose model declares no
+# window leaves the gauge out and keeps the nudge. Set `compactGaugeEnabled` to
+# false to drop the number and keep the instruction.
+#
 # Every text is plain model-facing text: write them as instructions to the agent,
 # and keep any house rule that belongs with them here rather than in the row's
 # code.
@@ -42,4 +49,5 @@
         roundNoticeEnabled: true
         askEnabled: true
         compactEnabled: true
+        compactGaugeEnabled: true
         compactRetainRatio: 0.2

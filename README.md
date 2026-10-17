@@ -31,7 +31,9 @@ it reaches its objective, and the harness's `/compact` command is human-driven w
 requires an idle agent — neither is reachable from a tool call, which always runs inside an open turn.
 The row publishes `compact_context` and names it in the per-round notice: the model can replace a
 balanced prefix of its own history with a summary and continue from there, keeping a recent tail. The
-nudge appears only where the tool, a compaction backend, and the token meter all resolve.
+nudge appears only where the tool, a compaction backend, and the token meter all resolve. A **context
+gauge** rendered from the same meter and the routed model's declared window sits above the nudge, so
+"running low" is a number the model can act on rather than a guess.
 
 ## What it does
 
@@ -42,6 +44,7 @@ nudge appears only where the tool, a compaction backend, and the token meter all
 | A tool mask | `get_goal` / `create_goal` / `update_goal` on each agent's own scope | While that agent holds no goal, and again once its goal is `complete` |
 | An ask rule | Appended to whichever of the two texts the scope gets | Only while that scope can call `ask_user_question` |
 | A compaction tool | The global tool layer as `compact_context` | Whenever the row is mounted and `compactEnabled` is true |
+| A context gauge | Appended to the per-round notice, before the compact nudge | Only while the compact rule resolves and the routed model declares a window |
 | A compaction nudge | Appended to the per-round notice | Only while the tool, a compaction backend, and the token meter resolve for that agent |
 
 The paragraph sets the standing rule: earlier rounds' tool results are accumulated evidence rather
@@ -137,6 +140,22 @@ ask and goal variants follow.
 It is not in the standing system-prompt paragraph because it applies to one moment — a round that has
 grown long — rather than to every request while the goal is active.
 
+The gauge is the second half of that moment. At the round's first step the row measures the same
+request pressure the automatic compaction policy reads, resolves the window of the model that will
+serve the round through `ctx.llm.resolveModelInfo`, and renders:
+
+```
+<goal_round_context>
+Context use: about 73000 of 131072 tokens; about 58072 remain (56% used).
+</goal_round_context>
+```
+
+The measurement is taken after `next()` returns, so a pressure compaction that ran earlier in the same
+pre-step is already reflected. A route whose model declares no window leaves the gauge out and keeps
+the nudge; `compactGaugeEnabled: false` drops the number while keeping the instruction. The four
+placeholders are required configuration, so a deployment cannot silently ship a gauge with the number
+missing.
+
 ### Why the paragraph is scoped to active goals
 
 The section's text is evaluated per assembly, and the assembly's scope is the Agent. A session that
@@ -173,10 +192,13 @@ Every field lives in [cordis.patch.yml](cordis.patch.yml) or in the row's `confi
 | `askNoticeText` | built in | The `<goal_round_ask>` block appended to the notice |
 | `compactEnabled` | `true` | Publish `compact_context` and append its nudge to the notice |
 | `compactNoticeText` | built in | The `<goal_round_compact>` block appended to the notice |
+| `compactGaugeEnabled` | `true` | Append the measured context gauge before the nudge |
+| `compactGaugeText` | built in | The gauge template; must contain `{used}`, `{window}`, `{remaining}`, and `{percent}` |
 | `compactRetainRatio` | `0.2` | Fraction of the measured context kept verbatim below the compacted prefix |
 
 A wrong value fails the row's activation rather than silently disabling half of it: every flag must
-be a boolean, every text a non-empty string, and `compactRetainRatio` a number in `(0, 1)`.
+be a boolean, every text a non-empty string, `compactGaugeText` must carry all four placeholders, and
+`compactRetainRatio` must be a number in `(0, 1)`.
 
 ## What it requires from the composition
 
@@ -218,8 +240,8 @@ The notice is one `user/message` per round, carrying `roundNoticeText` as its si
 Its source is `{ kind: 'goal-stop-discipline', form: 'notice' }`; the `notice` form keeps Chat from
 rendering it as a prompt the human typed, so it appears as a collapsed notice in the transcript. A
 scope that can ask carries a second `<goal_round_ask>` block in that same block, not a second
-message; the same message carries a third `<goal_round_compact>` block where the compaction tool and
-its services resolve.
+message; the same message carries a `<goal_round_context>` gauge and a `<goal_round_compact>` block
+where the compaction tool and its services resolve.
 
 When the model follows the ask rule, the question is a real `ask_user_question` tool call, so it
 renders as an answerable question in the transcript and the round waits for the reply — the only form
@@ -269,7 +291,9 @@ tool but no goal tool still gets it, that `compact_context` is published with a 
 definition, selects a balanced range that keeps the system head, the goal prompt, and the open step,
 calls the backend's `compactRegion` with the caller's signal, reports an empty or failed compaction
 without throwing, disappears with `compactEnabled: false`, and is unregistered with the row, that the
-compact nudge follows the tool, the backend, and the meter, and every rejected config value:
+compact nudge follows the tool, the backend, and the meter, that the gauge renders the meter's
+pressure and the routed window and precedes the nudge, that it is left out when the route declares no
+window or `compactGaugeEnabled` is false, and every rejected config value:
 
 ```sh
 node probe.mjs

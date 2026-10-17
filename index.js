@@ -69,7 +69,9 @@
  * backend's explicit-region operation, which runs inside the open turn and
  * needs no pressure threshold; it reports the backend's own result and never
  * writes a goal transition. The nudge is appended only where the tool, a
- * compaction backend, and the token meter all resolve for that agent.
+ * compaction backend, and the token meter all resolve for that agent, and a
+ * gauge rendered from the live measurement and the routed model's declared
+ * window rides beside it so "running low" is a number, not a guess.
  *
  * @module dsh-goal-stop-discipline
  */
@@ -236,6 +238,18 @@ const DEFAULT_COMPACT_NOTICE_TEXT =
   + 'so the round can continue; do this before the context runs out, not after a request fails.\n'
   + '</goal_round_compact>'
 
+/**
+ * The block appended before the compact nudge with the live context numbers.
+ *
+ * `{used}`, `{window}`, `{remaining}`, and `{percent}` are replaced at the
+ * round's first step. Every placeholder is required, so a deployment cannot
+ * silently drop the number the model is supposed to read.
+ */
+const DEFAULT_COMPACT_GAUGE_TEXT =
+  '<goal_round_context>\n'
+  + 'Context use: about {used} of {window} tokens; about {remaining} remain ({percent}% used).\n'
+  + '</goal_round_context>'
+
 /** Deployment defaults for {@link resolveConfig}. */
 const DEFAULT_CONFIG = {
   goalToolsOnDemand: true,
@@ -250,6 +264,8 @@ const DEFAULT_CONFIG = {
   askNoticeText: DEFAULT_ASK_NOTICE_TEXT,
   compactEnabled: true,
   compactNoticeText: DEFAULT_COMPACT_NOTICE_TEXT,
+  compactGaugeEnabled: true,
+  compactGaugeText: DEFAULT_COMPACT_GAUGE_TEXT,
   compactRetainRatio: 0.2,
 }
 
@@ -265,7 +281,7 @@ const DEFAULT_CONFIG = {
  */
 function resolveConfig(raw) {
   const config = { ...DEFAULT_CONFIG, ...(raw ?? {}) }
-  for (const field of ['goalToolsOnDemand', 'policyEnabled', 'roundNoticeEnabled', 'askEnabled', 'compactEnabled']) {
+  for (const field of ['goalToolsOnDemand', 'policyEnabled', 'roundNoticeEnabled', 'askEnabled', 'compactEnabled', 'compactGaugeEnabled']) {
     if (typeof config[field] !== 'boolean') {
       throw new TypeError(`dsh-goal-stop-discipline: config.${field} must be a boolean, got ${JSON.stringify(config[field])}`)
     }
@@ -279,10 +295,15 @@ function resolveConfig(raw) {
   }
   for (const field of [
     'policyText', 'policyTextWithoutGoalTools', 'roundNoticeText', 'roundNoticeTextWithoutGoalTools',
-    'askPolicyText', 'askNoticeText', 'compactNoticeText',
+    'askPolicyText', 'askNoticeText', 'compactNoticeText', 'compactGaugeText',
   ]) {
     if (typeof config[field] !== 'string' || config[field].trim() === '') {
       throw new TypeError(`dsh-goal-stop-discipline: config.${field} must be a non-empty string, got ${JSON.stringify(config[field])}`)
+    }
+  }
+  for (const placeholder of ['{used}', '{window}', '{remaining}', '{percent}']) {
+    if (!config.compactGaugeText.includes(placeholder)) {
+      throw new TypeError(`dsh-goal-stop-discipline: config.compactGaugeText must contain ${placeholder}`)
     }
   }
   return config
@@ -357,6 +378,75 @@ function compactionOf(ctx, agent) {
  */
 function tokenMeterOf(ctx, agent) {
   return agent.ctx?.get?.('tokenMeter') ?? ctx.get('tokenMeter')
+}
+
+/**
+ * The provider/model route the latest request used, or the agent's own default.
+ *
+ * The gauge prices the window of the model that will serve this round. The
+ * session's latest request header is the durable answer; an agent whose first
+ * request has not been recorded yet falls back to its configured route.
+ * @param agent - agent whose latest request header is read.
+ * @returns the routed target, or undefined when the composition names none.
+ */
+function routedTargetOf(agent) {
+  const config = agent.session?.requestHeader?.()?.config
+  if (typeof config?.provider === 'string' && config.provider.length > 0
+    && typeof config.model === 'string' && config.model.length > 0) {
+    return { provider: config.provider, model: config.model }
+  }
+  const options = agent.options
+  if (typeof options?.provider === 'string' && options.provider.length > 0
+    && typeof options.model === 'string' && options.model.length > 0) {
+    return { provider: options.provider, model: options.model }
+  }
+  return undefined
+}
+
+/**
+ * Render the per-round context gauge from live pressure and the routed model's
+ * declared window.
+ *
+ * The measurement is the request pressure the automatic compaction policy reads,
+ * taken after `next()` returns so a pressure reduction that ran in this pre-step
+ * is already reflected. A route without a declared window leaves the gauge out;
+ * the nudge still arrives.
+ * @param ctx - plugin context.
+ * @param agent - agent whose surface is measured.
+ * @param signal - the pre-step's cancellation signal.
+ * @param template - the configured placeholder text.
+ * @returns the rendered block, or an empty string when a fact is missing.
+ */
+async function contextGauge(ctx, agent, signal, template) {
+  const meter = tokenMeterOf(ctx, agent)
+  const llm = agent.ctx?.get?.('llm') ?? ctx.get('llm')
+  const target = routedTargetOf(agent)
+  if (meter === undefined || llm === undefined || target === undefined) return ''
+  let info
+  try {
+    info = await llm.resolveModelInfo(target.provider, target.model, signal)
+  } catch {
+    // A route with no catalog entry declares no window, so there is no gauge.
+    return ''
+  }
+  const window = info?.context?.contextWindow
+  if (!Number.isSafeInteger(window) || window <= 0) return ''
+  let measured
+  try {
+    measured = meter.measure(agent.session).totalTokens
+  } catch {
+    // A meter that cannot replay this surface leaves the gauge out.
+    return ''
+  }
+  if (typeof measured !== 'number' || !Number.isFinite(measured) || measured < 0) return ''
+  const used = Math.round(measured)
+  const remaining = Math.max(0, window - used)
+  const percent = Math.min(100, Math.round((used / window) * 100))
+  return template
+    .replaceAll('{used}', String(used))
+    .replaceAll('{window}', String(window))
+    .replaceAll('{remaining}', String(remaining))
+    .replaceAll('{percent}', String(percent))
 }
 
 /**
@@ -485,7 +575,8 @@ function compactTool(ctx, retainRatio) {
 /**
  * Install the discipline's contributions: the standing paragraph, the per-round
  * notice, the on-demand goal-tool mask, the conditional ask rule that rides in
- * both texts, and the conditional `compact_context` tool and its nudge.
+ * both texts, and the conditional `compact_context` tool with its gauge and
+ * nudge.
  * @param ctx - plugin context; listeners are scoped to it and disposed with it.
  * @param raw - the row's `config` object, or undefined.
  */
@@ -631,7 +722,7 @@ export function apply(ctx, raw) {
     })
   }
 
-  ctx.on('agent/pre-step', async ({ agent }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (!config.roundNoticeEnabled || decision.kind !== 'enter') return decision
     // The goal-round message is claimed by the round's first step only, so this
@@ -640,11 +731,17 @@ export function apply(ctx, raw) {
     const text = canCloseGoal(agent)
       ? config.roundNoticeText
       : config.roundNoticeTextWithoutGoalTools
-    // The ask and compact rules ride in the same notice message and the same
-    // text block, so a round still records exactly one notice.
+    // The ask, gauge, and compact rules ride in the same notice message and the
+    // same text block, so a round still records exactly one notice.
     const parts = [text]
     if (config.askEnabled && canAskUser(agent)) parts.push(config.askNoticeText)
-    if (config.compactEnabled && canCompact(agent)) parts.push(config.compactNoticeText)
+    if (config.compactEnabled && canCompact(agent)) {
+      if (config.compactGaugeEnabled) {
+        const gauge = await contextGauge(ctx, agent, signal, config.compactGaugeText)
+        if (gauge !== '') parts.push(gauge)
+      }
+      parts.push(config.compactNoticeText)
+    }
     return { ...decision, messages: [...decision.messages, noticeMessage(parts.join('\n'))] }
   })
 

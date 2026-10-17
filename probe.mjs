@@ -49,7 +49,11 @@ function fakeSession() {
   add(4, { type: 'tool/result', data: {} })
   add(5, { type: 'user/message', data: {} })
   add(6, call('c2'))
-  return { surface: { nodes }, eventAt: seq => events.get(seq) }
+  return {
+    surface: { nodes },
+    eventAt: seq => events.get(seq),
+    requestHeader: () => ({ config: { provider: 'fake', model: 'fake' } }),
+  }
 }
 
 /** A token meter over one fake surface, pricing every node at 100 tokens. */
@@ -87,6 +91,19 @@ function fakeAgent(id = 'agent-1', tools = [...GOAL_TOOLS, 'read']) {
   const session = fakeSession()
   const agent = { id, tools, masks: [], compaction: fakeCompaction(), session }
   agent.meter = fakeMeter(session)
+  agent.llm = {
+    window: 1000,
+    resolveModelInfo(provider, model) {
+      return Promise.resolve({
+        provider,
+        id: model,
+        name: model,
+        ...agent.llm.window === undefined
+          ? {}
+          : { context: { contextWindow: agent.llm.window } },
+      })
+    },
+  }
   agent.ctx = {
     tools: {
       restrict({ deny }) {
@@ -95,7 +112,11 @@ function fakeAgent(id = 'agent-1', tools = [...GOAL_TOOLS, 'read']) {
         return () => { mask.released = true }
       },
     },
-    get: service => (service === 'tokenMeter' ? agent.meter : undefined),
+    get: (service) => {
+      if (service === 'tokenMeter') return agent.meter
+      if (service === 'llm') return agent.llm
+      return undefined
+    },
   }
   return agent
 }
@@ -528,6 +549,40 @@ async function main() {
     assert.ok(!text.includes('<goal_round_compact>'))
   })
 
+  check('renders the context gauge from the live measurement and the routed window', async () => {
+    const harness = mount()
+    const messages = [goalRound(1)]
+    const decision = await harness.step(fakeAgent('agent-gauge'), messages, { kind: 'enter', messages })
+    const text = decision.messages[1].content[0].text
+    assert.ok(text.includes('<goal_round_context>'))
+    assert.ok(text.includes('about 600 of 1000 tokens'), 'the used and window numbers come from the meter and the route')
+    assert.ok(text.includes('about 400 remain (60% used)'))
+    assert.ok(
+      text.indexOf('<goal_round_context>') < text.indexOf('<goal_round_compact>'),
+      'the number precedes the instruction that acts on it',
+    )
+  })
+
+  check('leaves the gauge out when the routed model declares no window', async () => {
+    const harness = mount()
+    const agent = fakeAgent('agent-no-window')
+    agent.llm.window = undefined
+    const messages = [goalRound(1)]
+    const decision = await harness.step(agent, messages, { kind: 'enter', messages })
+    const text = decision.messages[1].content[0].text
+    assert.ok(!text.includes('<goal_round_context>'))
+    assert.ok(text.includes('<goal_round_compact>'), 'the nudge does not depend on the gauge')
+  })
+
+  check('drops the gauge when compactGaugeEnabled is false', async () => {
+    const harness = mount({ compactGaugeEnabled: false })
+    const messages = [goalRound(1)]
+    const decision = await harness.step(fakeAgent('agent-no-gauge'), messages, { kind: 'enter', messages })
+    const text = decision.messages[1].content[0].text
+    assert.ok(!text.includes('<goal_round_context>'))
+    assert.ok(text.includes(CALLS_COMPACT_TOOL), 'the instruction without the number is better than neither')
+  })
+
   check('unregisters the compaction tool when the row unloads', () => {
     const harness = mount()
     harness.dispose()
@@ -567,6 +622,9 @@ async function main() {
     assert.throws(() => mount({ askPolicyText: '' }), /askPolicyText/)
     assert.throws(() => mount({ askNoticeText: '\n ' }), /askNoticeText/)
     assert.throws(() => mount({ compactNoticeText: '' }), /compactNoticeText/)
+    assert.throws(() => mount({ compactGaugeText: '' }), /compactGaugeText/)
+    assert.throws(() => mount({ compactGaugeText: '{used} of {window}' }), /must contain \{remaining\}/)
+    assert.throws(() => mount({ compactGaugeEnabled: 'yes' }), /compactGaugeEnabled/)
     assert.throws(() => mount({ compactRetainRatio: 0 }), /compactRetainRatio/)
     assert.throws(() => mount({ compactRetainRatio: 1 }), /compactRetainRatio/)
     assert.throws(() => mount({ compactRetainRatio: 'half' }), /compactRetainRatio/)
