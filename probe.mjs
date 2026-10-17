@@ -281,7 +281,7 @@ async function main() {
     harness.change(withoutTools, { phase: 'active' })
     assert.ok(harness.render(withTools).includes(CALLS_UPDATE_GOAL), 'a preset with the goal tool is told to use it')
     assert.ok(!harness.render(withoutTools).includes(CALLS_UPDATE_GOAL), 'a preset without it is told not to look for it')
-    assert.ok(harness.render(withoutTools).includes('only the user can complete or pause it'))
+    assert.ok(harness.render(withoutTools).includes('cannot close this goal'))
   })
 
   check('drops the paragraph when policyEnabled is false', () => {
@@ -411,7 +411,7 @@ async function main() {
     assert.equal(decision.messages.length, 2)
     const text = decision.messages[1].content[0].text
     assert.ok(!text.includes(CALLS_UPDATE_GOAL), 'the notice does not name a tool the scope cannot call')
-    assert.ok(text.includes('The user closes the goal.'))
+    assert.ok(text.includes('only the user can close this goal'))
   })
 
   check('appends the ask rule inside the same notice message and text block', async () => {

@@ -47,22 +47,29 @@ gauge** rendered from the same meter and the routed model's declared window sits
 | A context gauge | Appended to the per-round notice, before the compact nudge | Only while the compact rule resolves and the routed model declares a window |
 | A compaction nudge | Appended to the per-round notice | Only while the tool, a compaction backend, and the token meter resolve for that agent |
 
-The paragraph sets the standing rule: earlier rounds' tool results are accumulated evidence rather
-than narration to re-derive, inspect only what a change could have invalidated, decide the round's
-outcome before running further tools, and report what you did not confirm instead of confirming it
-again.
+The paragraph states the one rule the harness's continuation prompt leaves out: earlier rounds'
+results are still current evidence, so re-inspect only what may have changed. It then gives the
+stopping rule: close the goal when the objective is met, or, without goal tools, report the outcome
+and stop.
 
-The notice repeats it where it has the most weight — immediately after the continuation prompt the
-model has just read — and says what to do next: complete the goal if the objective is already met,
-otherwise take the single action that reduces the remaining work.
+The notice repeats those two sentences where they have the most weight — immediately after the
+continuation prompt the model has just read.
+
+### Why the injected text is short
+
+The model already knows how to work. The injected text carries only what the harness does not say:
+earlier results still count, when to close the goal, that asking needs `ask_user_question`, that
+`compact_context` exists, and the current budget. Generic advice — take one action, report
+uncertainty, avoid re-verifying beyond the evidence clause — is deliberately absent: it costs tokens
+every round without changing behavior.
 
 The ask rule says that a decision, a confirmation, or information only the user can supply is
 something to put to the user as a question, not to write into the reply: the harness delivers
 `ask_user_question` as a visible, answerable question and the round waits for the reply, while
 anything written into the message is never delivered as a question and the goal simply starts its
-next round without it. It is asked **before** completing or blocking the goal, because a closed goal
-ends the run — the harness's own wrap-up then forbids further tool calls, so a question that arrives
-too late is prose in a closing message.
+next round without it. The standing paragraph asks it **before** completing or blocking the goal,
+because a closed goal ends the run — the harness's own wrap-up then forbids further tool calls, so a
+question that arrives too late is prose in a closing message.
 
 ### The tool mask
 
@@ -146,7 +153,7 @@ serve the round through `ctx.llm.resolveModelInfo`, and renders:
 
 ```
 <goal_round_context>
-Context use: about 73000 of 131072 tokens; about 58072 remain (56% used).
+Context: about 73000 of 131072 tokens; about 58072 remain (56% used).
 </goal_round_context>
 ```
 

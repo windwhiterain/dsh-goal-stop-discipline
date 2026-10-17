@@ -157,24 +157,20 @@ const COMPACT_OUTPUT_SCHEMA = {
   required: ['compacted', 'shadowedItems', 'shadowedTokens', 'message'],
 }
 
-/** Shared opening: what a round inherits from the rounds before it. */
+/**
+ * Shared opening: the evidence rule the harness prompt does not state, because
+ * it asks for fresh inspection without saying that earlier results still count.
+ *
+ * This is the only evidence rule the row repeats. Generic working advice belongs
+ * to the model, not to an injected prompt.
+ */
 const EVIDENCE_RULE =
-  'Goal round discipline. A goal round continues work that earlier rounds in this '
-  + 'session already started, so this session\'s history — including earlier rounds\' '
-  + 'tool results — is accumulated evidence, not narration to be re-derived. Inspect '
-  + 'only what a change since that evidence could have invalidated, and never repeat '
-  + 'an inspection whose result the session already records.\n\n'
+  'Earlier results stay valid; re-inspect only what changed.\n\n'
 
 /** The paragraph for an agent that can call `update_goal` itself. */
 const DEFAULT_POLICY_TEXT =
   EVIDENCE_RULE
-  + 'Decide the outcome of this round before running further tools. When the '
-  + 'objective is achieved, call update_goal with action complete and let the run '
-  + 'end; a completed goal requests no further rounds. When it is not achieved, take '
-  + 'the single action that most reduces the remaining work and leave the goal active '
-  + 'for the next round. Uncertainty about side conditions, and work beyond the '
-  + 'objective, belong in the closing message rather than in another round of '
-  + 'checking: say what you did not confirm instead of confirming it again.'
+  + 'If the objective is met, call update_goal with action complete.'
 
 /**
  * The paragraph for an agent with no goal tools. The goal is still armed and
@@ -183,30 +179,20 @@ const DEFAULT_POLICY_TEXT =
  */
 const DEFAULT_POLICY_TEXT_WITHOUT_GOAL_TOOLS =
   EVIDENCE_RULE
-  + 'Decide the outcome of this round before running further tools. You have no tool '
-  + 'that closes this goal: only the user can complete or pause it. State the outcome '
-  + 'plainly in your closing message — whether the objective is now achieved, or the one '
-  + 'action that still remains — and then stop. Do not spend another round confirming '
-  + 'what you have already established, and do not wait for a tool that will not come.'
+  + 'You cannot close this goal; state the outcome in your closing message and stop.'
 
 /** The notice for an agent that can call `update_goal` itself. */
 const DEFAULT_ROUND_NOTICE_TEXT =
   '<goal_round_discipline>\n'
-  + 'This round continues the same goal as the earlier rounds of this session. Their '
-  + 'tool results are your evidence and remain valid: re-run an inspection only if '
-  + 'something has changed since it. If the objective is already achieved, call '
-  + 'update_goal with action complete and end the run now. Otherwise take the single '
-  + 'next action that reduces the remaining work and leave the goal active.\n'
+  + 'Earlier results stay valid; re-inspect only what changed. If the objective is met, call update_goal '
+  + 'with action complete.\n'
   + '</goal_round_discipline>'
 
 /** The notice for an agent with no goal tools. */
 const DEFAULT_ROUND_NOTICE_TEXT_WITHOUT_GOAL_TOOLS =
   '<goal_round_discipline>\n'
-  + 'This round continues the same goal as the earlier rounds of this session. Their '
-  + 'tool results are your evidence and remain valid: re-run an inspection only if '
-  + 'something has changed since it. You have no tool that closes this goal, so do not '
-  + 'look for one: say in your closing message whether the objective is now achieved or '
-  + 'what single action remains, then stop. The user closes the goal.\n'
+  + 'Earlier results stay valid; re-inspect only what changed. If the objective is met, say so and stop; '
+  + 'only the user can close this goal.\n'
   + '</goal_round_discipline>'
 
 /**
@@ -215,27 +201,19 @@ const DEFAULT_ROUND_NOTICE_TEXT_WITHOUT_GOAL_TOOLS =
  * tool is orthogonal to the goal tools: a scope may have one, both, or neither.
  */
 const DEFAULT_ASK_POLICY_TEXT =
-  'If this round needs the user — a decision, a confirmation, or information you cannot obtain yourself '
-  + '— call ask_user_question and wait for the answer. A question written into your message is not '
-  + 'delivered to the user, and the next round starts without it. Ask before you complete or block the '
-  + "goal: once the goal is closed this run ends, and what you asked survives only as prose in your "
-  + 'closing message.'
+  'If the round needs the user, call ask_user_question before completing or blocking; prose questions '
+  + 'are not delivered.'
 
 /** The block appended to the per-round notice for a scope that can ask. */
 const DEFAULT_ASK_NOTICE_TEXT =
   '<goal_round_ask>\n'
-  + 'If this round needs the user — a decision, a confirmation, or information you cannot obtain '
-  + 'yourself — call ask_user_question and wait for the answer, before you complete or block the goal. '
-  + 'A question written into your message is not delivered to the user: this goal simply starts its next '
-  + 'round without it.\n'
+  + 'If the round needs the user, call ask_user_question; a question in your message is not delivered.\n'
   + '</goal_round_ask>'
 
 /** The block appended to the per-round notice for a scope that can compact. */
 const DEFAULT_COMPACT_NOTICE_TEXT =
   '<goal_round_compact>\n'
-  + 'If this round is running low on context — the conversation has grown long and substantial work '
-  + 'remains — call compact_context before your next request. It replaces older history with a summary '
-  + 'so the round can continue; do this before the context runs out, not after a request fails.\n'
+  + 'If context runs low, call compact_context.\n'
   + '</goal_round_compact>'
 
 /**
@@ -247,7 +225,7 @@ const DEFAULT_COMPACT_NOTICE_TEXT =
  */
 const DEFAULT_COMPACT_GAUGE_TEXT =
   '<goal_round_context>\n'
-  + 'Context use: about {used} of {window} tokens; about {remaining} remain ({percent}% used).\n'
+  + 'Context: about {used} of {window} tokens; about {remaining} remain ({percent}% used).\n'
   + '</goal_round_context>'
 
 /** Deployment defaults for {@link resolveConfig}. */
