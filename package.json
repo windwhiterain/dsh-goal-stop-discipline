@@ -3,14 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "End a DeepSeek Harness goal round when its objective is met, instead of re-verifying the same ground every round.",
+  "description": "End a DeepSeek Harness goal round when its objective is met, instead of re-verifying the same ground every round, and let a long round compact its own context.",
   "keywords": [
     "dsh",
     "deepseek-harness",
     "cordis",
     "bundle",
     "plugin",
-    "goal"
+    "goal",
+    "compaction"
   ],
   "license": "MIT",
   "author": "windwhiterain",

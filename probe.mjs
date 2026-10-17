@@ -31,12 +31,62 @@ function fakeGoalService() {
 }
 
 /**
+ * A session surface with a system head, one completed step, and the open step a
+ * tool call runs in: [system, user, assistant+call, result, round prompt,
+ * assistant+call]. Every node is priced at 100 tokens by {@link fakeMeter}.
+ */
+function fakeSession() {
+  const events = new Map()
+  const nodes = []
+  const add = (seq, event) => {
+    nodes.push(seq)
+    events.set(seq, event)
+  }
+  const call = id => ({ type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', id }] } } })
+  add(1, { type: 'system/message', data: {} })
+  add(2, { type: 'user/message', data: {} })
+  add(3, call('c1'))
+  add(4, { type: 'tool/result', data: {} })
+  add(5, { type: 'user/message', data: {} })
+  add(6, call('c2'))
+  return { surface: { nodes }, eventAt: seq => events.get(seq) }
+}
+
+/** A token meter over one fake surface, pricing every node at 100 tokens. */
+function fakeMeter(session) {
+  return {
+    /** The surface snapshot the tool selects its range from. */
+    measure: () => ({
+      totalTokens: session.surface.nodes.length * 100,
+      nodes: session.surface.nodes.map(seq => ({ seq, tokens: 100 })),
+    }),
+  }
+}
+
+/** A compaction backend standing in for the agent's isolated `ctx.compaction`. */
+function fakeCompaction() {
+  const engine = {
+    calls: [],
+    result: { shadowedSeqs: [2, 3, 4], shadowedTokenCount: 300 },
+    error: undefined,
+    compactRegion(start, end, agent, signal) {
+      engine.calls.push({ start, end, agent, signal })
+      if (engine.error !== undefined) return Promise.reject(engine.error)
+      return Promise.resolve(engine.result)
+    },
+  }
+  return engine
+}
+
+/**
  * An agent that is its own assembly scope, as `assembleContextFor()` builds.
  * `tools` is what the agent's scope inherits; `masks` records every restriction
  * this row registers and whether it has been given back.
  */
 function fakeAgent(id = 'agent-1', tools = [...GOAL_TOOLS, 'read']) {
-  const agent = { id, tools, masks: [] }
+  const session = fakeSession()
+  const agent = { id, tools, masks: [], compaction: fakeCompaction(), session }
+  agent.meter = fakeMeter(session)
   agent.ctx = {
     tools: {
       restrict({ deny }) {
@@ -45,35 +95,61 @@ function fakeAgent(id = 'agent-1', tools = [...GOAL_TOOLS, 'read']) {
         return () => { mask.released = true }
       },
     },
+    get: service => (service === 'tokenMeter' ? agent.meter : undefined),
   }
   return agent
+}
+
+/** Whether one live mask hides this tool from the agent. */
+function isMasked(agent, tool) {
+  return agent.masks.some(mask => !mask.released && mask.deny.includes(tool))
 }
 
 /** Whether one agent may still call this tool, after every live mask. */
 function canCall(agent, tool) {
   if (!agent.tools.includes(tool)) return false
-  return !agent.masks.some(mask => !mask.released && mask.deny.includes(tool))
+  return !isMasked(agent, tool)
 }
 
-/** A context recording listeners, sections, and plugin-owned effects. */
+/** A context recording listeners, sections, plugin-owned effects, and global tools. */
 function fakeCtx() {
   const listeners = new Map()
   const goalService = fakeGoalService()
   const sections = []
   const warnings = []
   const effects = []
+  const registered = new Map()
   return {
     listeners,
     sections,
     warnings,
     effects,
     goalService,
+    registered,
     agents: { list: () => [...goalService.goals.keys()] },
     logger: { warn: message => warnings.push(message) },
-    get: service => (service === 'goals' ? goalService : undefined),
+    get: (service) => {
+      if (service === 'goals') return goalService
+      if (service === 'agentPresets') {
+        return {
+          serviceFor: (agent, name) => (name === 'compaction' ? agent.compaction : undefined),
+        }
+      }
+      return undefined
+    },
     tools: {
-      get: (toolName, scope) => (canCall(scope, toolName) ? { name: toolName } : undefined),
-      schemas: scope => scope.tools.map(name => ({ name })),
+      register(definition) {
+        registered.set(definition.name, definition)
+        return () => registered.delete(definition.name)
+      },
+      get: (toolName, scope) => {
+        if (registered.has(toolName)) {
+          if (scope !== undefined && isMasked(scope, toolName)) return undefined
+          return registered.get(toolName)
+        }
+        return canCall(scope, toolName) ? { name: toolName } : undefined
+      },
+      schemas: scope => [...new Set([...registered.keys(), ...scope.tools])].map(name => ({ name })),
     },
     systemPrompt: {
       getSectionOrder: key => ({ TOOL_GOAL: 400 })[key],
@@ -108,6 +184,8 @@ function mount(config, existingAgents = []) {
     section,
     /** The text the section contributes for one agent's assembly. */
     render: agent => (agent === undefined ? section.text({}) : section.text({ scope: agent })),
+    /** The definition the row registered under one global tool name. */
+    tool: toolName => ctx.registered.get(toolName),
     /** Report one goal transition. */
     change(agent, goal) {
       ctx.listeners.get('goal/changed')({ agent, change: { operation: goal.phase, ref: {}, goal } })
@@ -133,6 +211,12 @@ const CALLS_UPDATE_GOAL = 'call update_goal'
 
 /** The clause that tells a model that can ask to call the question tool. */
 const CALLS_ASK_TOOL = 'call ask_user_question'
+
+/** The clause that tells a model that can compact to call the compaction tool. */
+const CALLS_COMPACT_TOOL = 'call compact_context'
+
+/** One tool call's execution context for the fake registry. */
+const EXEC = { signal: new AbortController().signal }
 
 /** Run every case and report the outcome. */
 async function main() {
@@ -343,6 +427,113 @@ async function main() {
     assert.ok(!decision.messages[1].content[0].text.includes(CALLS_ASK_TOOL))
   })
 
+  check('publishes compact_context with a registry-ready definition', () => {
+    const harness = mount()
+    const tool = harness.tool('compact_context')
+    assert.ok(tool, 'the row registers its own tool')
+    assert.equal(tool.name, 'compact_context')
+    assert.equal(tool.parameters.type, 'object')
+    assert.equal(tool.output.schema.additionalProperties, false)
+    assert.deepEqual(
+      tool.output.schema.required,
+      ['compacted', 'shadowedItems', 'shadowedTokens', 'message'],
+    )
+    const rendered = tool.output.render({}, { compacted: false, shadowedItems: 0, shadowedTokens: 0, message: 'x' })
+    assert.equal(rendered[0].type, 'text')
+    assert.ok(rendered[0].text.includes('"compacted":false'))
+  })
+
+  check('does not publish the tool when compactEnabled is false', () => {
+    const harness = mount({ compactEnabled: false })
+    assert.equal(harness.tool('compact_context'), undefined)
+  })
+
+  check('compacts the calling agent through the explicit-region entry', async () => {
+    const harness = mount()
+    const agent = fakeAgent('agent-compact')
+    const value = await harness.tool('compact_context').execute({}, { ...EXEC, agent })
+    assert.equal(agent.compaction.calls.length, 1)
+    assert.deepEqual(
+      [agent.compaction.calls[0].start, agent.compaction.calls[0].end],
+      [2, 4],
+      'the range keeps the goal prompt and the open step, and never shadows the system head',
+    )
+    assert.equal(agent.compaction.calls[0].agent, agent)
+    assert.equal(agent.compaction.calls[0].signal, EXEC.signal)
+    assert.equal(value.compacted, true)
+    assert.equal(value.shadowedItems, 3)
+    assert.equal(value.shadowedTokens, 300)
+    assert.ok(value.message.includes('Compacted 3'))
+  })
+
+  check('reports a surface with no compactable prefix', async () => {
+    const harness = mount()
+    const agent = fakeAgent('agent-nothing-to-compact')
+    agent.meter = {
+      measure: () => ({
+        totalTokens: 10_000,
+        nodes: agent.session.surface.nodes.map(seq => ({ seq, tokens: 100 })),
+      }),
+    }
+    const value = await harness.tool('compact_context').execute({}, { ...EXEC, agent })
+    assert.equal(agent.compaction.calls.length, 0, 'nothing is replaced when the retained tail is the whole surface')
+    assert.equal(value.compacted, false)
+    assert.ok(value.message.includes('No older history'))
+  })
+
+  check('reports a failed compaction without failing the tool call', async () => {
+    const harness = mount()
+    const agent = fakeAgent('agent-compact-fails')
+    agent.compaction.error = new Error('summary is not smaller')
+    const value = await harness.tool('compact_context').execute({}, { ...EXEC, agent })
+    assert.equal(value.compacted, false)
+    assert.ok(value.message.includes('could not run'))
+    assert.ok(value.message.includes('summary is not smaller'))
+    assert.ok(harness.ctx.warnings.some(line => line.includes('compact_context failed')))
+  })
+
+  check('reports a session whose composition has no compaction backend', async () => {
+    const harness = mount()
+    const agent = fakeAgent('agent-no-compaction')
+    agent.compaction = undefined
+    const value = await harness.tool('compact_context').execute({}, { ...EXEC, agent })
+    assert.equal(value.compacted, false)
+    assert.ok(value.message.includes('not available'))
+  })
+
+  check('names compact_context only where the tool and a backend resolve', async () => {
+    const harness = mount()
+    const withBackend = fakeAgent('agent-compact-notice')
+    const withoutBackend = fakeAgent('agent-no-compaction-notice')
+    withoutBackend.compaction = undefined
+    const withoutMeter = fakeAgent('agent-no-meter-notice')
+    withoutMeter.meter = undefined
+    const messages = [goalRound(1)]
+    const withText = (await harness.step(withBackend, messages, { kind: 'enter', messages })).messages[1].content[0].text
+    const withoutText = (await harness.step(withoutBackend, messages, { kind: 'enter', messages })).messages[1].content[0].text
+    const noMeterText = (await harness.step(withoutMeter, messages, { kind: 'enter', messages })).messages[1].content[0].text
+    assert.ok(withText.includes(CALLS_COMPACT_TOOL), 'a scope that can compact is told to call it')
+    assert.ok(withText.includes('<goal_round_compact>'))
+    assert.ok(!withoutText.includes(CALLS_COMPACT_TOOL), 'a scope with no backend is told nothing about compacting')
+    assert.ok(!withoutText.includes('<goal_round_compact>'))
+    assert.ok(!noMeterText.includes(CALLS_COMPACT_TOOL), 'a scope with no meter cannot select a range')
+  })
+
+  check('drops the compact rule when compactEnabled is false', async () => {
+    const harness = mount({ compactEnabled: false })
+    const messages = [goalRound(1)]
+    const decision = await harness.step(fakeAgent(), messages, { kind: 'enter', messages })
+    const text = decision.messages[1].content[0].text
+    assert.ok(!text.includes(CALLS_COMPACT_TOOL))
+    assert.ok(!text.includes('<goal_round_compact>'))
+  })
+
+  check('unregisters the compaction tool when the row unloads', () => {
+    const harness = mount()
+    harness.dispose()
+    assert.equal(harness.tool('compact_context'), undefined)
+  })
+
   check('leaves an ordinary step and a round-zero message alone', async () => {
     const harness = mount()
     const agent = fakeAgent()
@@ -375,9 +566,14 @@ async function main() {
     assert.throws(() => mount({ roundNoticeTextWithoutGoalTools: '  ' }), /roundNoticeTextWithoutGoalTools/)
     assert.throws(() => mount({ askPolicyText: '' }), /askPolicyText/)
     assert.throws(() => mount({ askNoticeText: '\n ' }), /askNoticeText/)
+    assert.throws(() => mount({ compactNoticeText: '' }), /compactNoticeText/)
+    assert.throws(() => mount({ compactRetainRatio: 0 }), /compactRetainRatio/)
+    assert.throws(() => mount({ compactRetainRatio: 1 }), /compactRetainRatio/)
+    assert.throws(() => mount({ compactRetainRatio: 'half' }), /compactRetainRatio/)
     assert.throws(() => mount({ policyEnabled: 'yes' }), /policyEnabled/)
     assert.throws(() => mount({ goalToolsOnDemand: 'yes' }), /goalToolsOnDemand/)
     assert.throws(() => mount({ askEnabled: 'yes' }), /askEnabled/)
+    assert.throws(() => mount({ compactEnabled: 'yes' }), /compactEnabled/)
   })
 
   let failed = 0

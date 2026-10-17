@@ -59,6 +59,18 @@
  * question tool is told nothing about asking, and one that does is told to ask
  * before it closes the goal, while the goal is still live.
  *
+ * A fifth contribution gives a long round a way to make room for itself. An
+ * autonomous goal can outgrow its context window before it reaches its
+ * objective, and the harness's `/compact` command is human-driven while
+ * `compactNow()` reserves an idle agent — neither is reachable from a tool call
+ * inside an open turn. The row publishes `compact_context` and names it in the
+ * per-round notice, where the model has just been reminded what the round is
+ * for. The tool selects a balanced prefix that keeps a recent tail and calls the
+ * backend's explicit-region operation, which runs inside the open turn and
+ * needs no pressure threshold; it reports the backend's own result and never
+ * writes a goal transition. The nudge is appended only where the tool, a
+ * compaction backend, and the token meter all resolve for that agent.
+ *
  * @module dsh-goal-stop-discipline
  */
 
@@ -116,6 +128,32 @@ const KEEPS_GOAL_TOOLS = new Set(['active', 'paused', 'blocked'])
  * to call a tool its scope cannot reach.
  */
 const ASK_TOOL = 'ask_user_question'
+
+/**
+ * The model-facing tool that compacts an open turn's history. Its name is fixed
+ * because the per-round notice names it; a configurable name would let the two
+ * drift apart.
+ */
+const COMPACT_TOOL = 'compact_context'
+
+/** Model-facing account of when a forced reduction is worth its cost. */
+const COMPACT_DESCRIPTION =
+  'Replace older conversation history with a summary so this session can continue a long round when '
+  + 'its context is nearly full. Use it before the context runs out and while you still have work to do; '
+  + 'the most recent messages are kept and the round continues from the summary.'
+
+/** Canonical result of one `compact_context` call. */
+const COMPACT_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    compacted: { type: 'boolean' },
+    shadowedItems: { type: 'integer' },
+    shadowedTokens: { type: 'integer' },
+    message: { type: 'string' },
+  },
+  required: ['compacted', 'shadowedItems', 'shadowedTokens', 'message'],
+}
 
 /** Shared opening: what a round inherits from the rounds before it. */
 const EVIDENCE_RULE =
@@ -190,6 +228,14 @@ const DEFAULT_ASK_NOTICE_TEXT =
   + 'round without it.\n'
   + '</goal_round_ask>'
 
+/** The block appended to the per-round notice for a scope that can compact. */
+const DEFAULT_COMPACT_NOTICE_TEXT =
+  '<goal_round_compact>\n'
+  + 'If this round is running low on context — the conversation has grown long and substantial work '
+  + 'remains — call compact_context before your next request. It replaces older history with a summary '
+  + 'so the round can continue; do this before the context runs out, not after a request fails.\n'
+  + '</goal_round_compact>'
+
 /** Deployment defaults for {@link resolveConfig}. */
 const DEFAULT_CONFIG = {
   goalToolsOnDemand: true,
@@ -202,6 +248,9 @@ const DEFAULT_CONFIG = {
   askEnabled: true,
   askPolicyText: DEFAULT_ASK_POLICY_TEXT,
   askNoticeText: DEFAULT_ASK_NOTICE_TEXT,
+  compactEnabled: true,
+  compactNoticeText: DEFAULT_COMPACT_NOTICE_TEXT,
+  compactRetainRatio: 0.2,
 }
 
 /**
@@ -216,14 +265,21 @@ const DEFAULT_CONFIG = {
  */
 function resolveConfig(raw) {
   const config = { ...DEFAULT_CONFIG, ...(raw ?? {}) }
-  for (const field of ['goalToolsOnDemand', 'policyEnabled', 'roundNoticeEnabled', 'askEnabled']) {
+  for (const field of ['goalToolsOnDemand', 'policyEnabled', 'roundNoticeEnabled', 'askEnabled', 'compactEnabled']) {
     if (typeof config[field] !== 'boolean') {
       throw new TypeError(`dsh-goal-stop-discipline: config.${field} must be a boolean, got ${JSON.stringify(config[field])}`)
     }
   }
+  if (typeof config.compactRetainRatio !== 'number' || !Number.isFinite(config.compactRetainRatio)
+    || config.compactRetainRatio <= 0 || config.compactRetainRatio >= 1) {
+    throw new TypeError(
+      `dsh-goal-stop-discipline: config.compactRetainRatio must be a number in (0, 1), `
+      + `got ${JSON.stringify(config.compactRetainRatio)}`,
+    )
+  }
   for (const field of [
     'policyText', 'policyTextWithoutGoalTools', 'roundNoticeText', 'roundNoticeTextWithoutGoalTools',
-    'askPolicyText', 'askNoticeText',
+    'askPolicyText', 'askNoticeText', 'compactNoticeText',
   ]) {
     if (typeof config[field] !== 'string' || config[field].trim() === '') {
       throw new TypeError(`dsh-goal-stop-discipline: config.${field} must be a non-empty string, got ${JSON.stringify(config[field])}`)
@@ -265,9 +321,171 @@ function noticeMessage(text) {
 }
 
 /**
+ * Build one canonical `compact_context` result.
+ * @param compacted - whether the engine replaced a range.
+ * @param shadowedItems - number of surface nodes the engine replaced.
+ * @param shadowedTokens - the engine's heuristic price of the replaced range.
+ * @param message - model-facing account of what happened and what to do next.
+ * @returns the value declared by {@link COMPACT_OUTPUT_SCHEMA}.
+ */
+function compactValue(compacted, shadowedItems, shadowedTokens, message) {
+  return { compacted, shadowedItems, shadowedTokens, message }
+}
+
+/**
+ * The compaction backend this agent's composition supplies.
+ *
+ * A preset's backend can publish inside an `isolate` realm, where a direct
+ * `agent.ctx.get('compaction')` does not resolve; the preset registry knows the
+ * revision that agent joined. The direct read remains the fallback for a
+ * deployment without a preset roster.
+ * @param ctx - plugin context.
+ * @param agent - agent whose composition is asked.
+ * @returns the backend, or undefined when this session has none.
+ */
+function compactionOf(ctx, agent) {
+  const scoped = ctx.get('agentPresets')?.serviceFor?.(agent, 'compaction')
+  if (scoped !== undefined) return scoped
+  return agent.ctx?.get?.('compaction') ?? ctx.get('compaction')
+}
+
+/**
+ * The token meter this agent's composition supplies.
+ * @param ctx - plugin context.
+ * @param agent - agent whose composition is asked.
+ * @returns the meter, or undefined when this session has none.
+ */
+function tokenMeterOf(ctx, agent) {
+  return agent.ctx?.get?.('tokenMeter') ?? ctx.get('tokenMeter')
+}
+
+/**
+ * The change in unanswered tool calls one surface event contributes.
+ *
+ * The cut rule mirrors `@deepseek-ai/dsh-compaction`'s tool-pairing balance: a
+ * cut is safe when every tool call before it has its result. This row cannot
+ * import that helper without depending on the harness, so it folds the same
+ * per-event delta here.
+ * @param event - one session event in surface order.
+ * @returns the delta, or zero for events that carry no tool call or result.
+ */
+function toolCallDelta(event) {
+  switch (event?.type) {
+    case 'assistant/message':
+      return event.data.message.content.filter(block => block.type === 'tool-call').length
+    case 'tool/result':
+      return -1
+    default:
+      return 0
+  }
+}
+
+/**
+ * Select a balanced prefix of the current surface, retaining a recent tail.
+ *
+ * The system head at surface node 0 is never shadowed. Both edges are cuts with
+ * no unanswered tool call, so the replacement cannot split a call from its
+ * result.
+ * @param session - session whose surface is read.
+ * @param measurement - the token meter's snapshot for that surface.
+ * @param retainTokens - minimum recent tail to keep verbatim.
+ * @returns the inclusive surface span to replace, or null when no cut fits.
+ */
+function selectCompactRange(session, measurement, retainTokens) {
+  const nodes = session?.surface?.nodes
+  const priced = measurement?.nodes
+  if (!Array.isArray(nodes) || !Array.isArray(priced)
+    || nodes.length === 0 || nodes.length !== priced.length) return null
+  // One entry per cut: entry `i` is the cut before surface node `i`, and the
+  // final entry is the cut after the tail.
+  const cuts = [true]
+  let open = 0
+  for (let index = 0; index < nodes.length; index += 1) {
+    if (priced[index]?.seq !== nodes[index]) return null
+    const event = session.eventAt(nodes[index])
+    if (event === undefined) return null
+    open += toolCallDelta(event)
+    if (open < 0) return null
+    cuts.push(open === 0)
+  }
+  const firstIdx = session.eventAt(nodes[0])?.type === 'system/message' ? 1 : 0
+  let keep = nodes.length
+  let accumulated = 0
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    accumulated += priced[index]?.tokens ?? 0
+    keep = index
+    if (accumulated >= retainTokens) break
+  }
+  if (keep <= firstIdx) return null
+  while (keep > firstIdx && cuts[keep] !== true) keep -= 1
+  if (keep <= firstIdx) return null
+  return { start: nodes[firstIdx], end: nodes[keep - 1] }
+}
+
+/**
+ * Build the `compact_context` tool for one row instance.
+ *
+ * A tool call runs inside the open turn it belongs to, so `compactNow()` is not
+ * an option: it reserves the agent's idle maintenance slot. The explicit-region
+ * operation is the public reduction path for a caller-selected span, so the tool
+ * selects a prefix that keeps a recent tail and lets the backend replace it.
+ * @param ctx - plugin context; the row owns the registration.
+ * @param retainRatio - fraction of the measured context kept verbatim.
+ * @returns a registry-ready tool definition.
+ */
+function compactTool(ctx, retainRatio) {
+  return {
+    name: COMPACT_TOOL,
+    description: COMPACT_DESCRIPTION,
+    parameters: { type: 'object', properties: {} },
+    output: {
+      schema: COMPACT_OUTPUT_SCHEMA,
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    /**
+     * Run one forced reduction for the calling agent.
+     * @param _args - no arguments; the tool always compacts this session.
+     * @param exec - the call's agent, cancellation signal, and dispatch identity.
+     * @returns whether anything was replaced and what the model should do next.
+     */
+    async execute(_args, exec) {
+      const agent = exec.agent
+      const compaction = agent === undefined ? undefined : compactionOf(ctx, agent)
+      const meter = agent === undefined ? undefined : tokenMeterOf(ctx, agent)
+      if (agent === undefined || compaction === undefined || meter === undefined) {
+        return compactValue(false, 0, 0, 'Compaction is not available in this session. Continue with the current context.')
+      }
+      try {
+        const measurement = meter.measure(agent.session)
+        const retainTokens = Math.max(1, Math.floor(measurement.totalTokens * retainRatio))
+        const range = selectCompactRange(agent.session, measurement, retainTokens)
+        if (range === null) {
+          return compactValue(false, 0, 0, 'No older history could be compacted right now. Continue with the current context.')
+        }
+        const result = await compaction.compactRegion(range.start, range.end, agent, exec.signal)
+        const shadowedItems = result.shadowedSeqs.length
+        const shadowedTokens = result.shadowedTokenCount
+        return compactValue(
+          true,
+          shadowedItems,
+          shadowedTokens,
+          `Compacted ${shadowedItems} older history items (~${shadowedTokens} tokens) into a summary. `
+          + 'Continue this round from that summary; the most recent messages are unchanged.',
+        )
+      } catch (error) {
+        if (exec.signal.aborted) throw error
+        const detail = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn(`dsh-goal-stop-discipline: ${COMPACT_TOOL} failed: ${detail}`)
+        return compactValue(false, 0, 0, `Compaction could not run: ${detail}. Continue with the current context.`)
+      }
+    },
+  }
+}
+
+/**
  * Install the discipline's contributions: the standing paragraph, the per-round
- * notice, the on-demand goal-tool mask, and the conditional ask rule that rides
- * in both texts.
+ * notice, the on-demand goal-tool mask, the conditional ask rule that rides in
+ * both texts, and the conditional `compact_context` tool and its nudge.
  * @param ctx - plugin context; listeners are scoped to it and disposed with it.
  * @param raw - the row's `config` object, or undefined.
  */
@@ -350,6 +568,20 @@ export function apply(ctx, raw) {
     return agent !== undefined && ctx.tools.get(ASK_TOOL, agent) !== undefined
   }
 
+  /**
+   * Whether one scope can compact its own history. All three are composition
+   * facts: the tool must be registered for this row, and the agent's own realm
+   * must supply both a compaction backend and a token meter. Naming the tool
+   * where any is missing would instruct a call that cannot succeed.
+   * @param agent - the scope asking.
+   * @returns whether the tool and the services it needs resolve for that agent.
+   */
+  function canCompact(agent) {
+    return ctx.tools.get(COMPACT_TOOL, agent) !== undefined
+      && compactionOf(ctx, agent) !== undefined
+      && tokenMeterOf(ctx, agent) !== undefined
+  }
+
   // A goal that already existed when this row loaded is adopted here, phase and
   // all; goals created later arrive through `goal/changed`. The phase is read
   // once per live agent, so a goal that keeps its tools never starts masked.
@@ -369,6 +601,14 @@ export function apply(ctx, raw) {
     if (KEEPS_GOAL_TOOLS.has(phase)) unmaskGoalTools(agent)
     else maskGoalTools(agent)
   })
+
+  if (config.compactEnabled) {
+    // Registered on this row's own scope, so the tool outlives no HMR reload.
+    ctx.effect(
+      () => ctx.tools.register(compactTool(ctx, config.compactRetainRatio)),
+      'goal-stop-discipline compact tool',
+    )
+  }
 
   if (config.policyEnabled) {
     ctx.systemPrompt.section({
@@ -400,10 +640,12 @@ export function apply(ctx, raw) {
     const text = canCloseGoal(agent)
       ? config.roundNoticeText
       : config.roundNoticeTextWithoutGoalTools
-    // The ask rule rides in the same notice message and the same text block, so
-    // a round still records exactly one notice.
-    const asked = config.askEnabled && canAskUser(agent) ? `${text}\n${config.askNoticeText}` : text
-    return { ...decision, messages: [...decision.messages, noticeMessage(asked)] }
+    // The ask and compact rules ride in the same notice message and the same
+    // text block, so a round still records exactly one notice.
+    const parts = [text]
+    if (config.askEnabled && canAskUser(agent)) parts.push(config.askNoticeText)
+    if (config.compactEnabled && canCompact(agent)) parts.push(config.compactNoticeText)
+    return { ...decision, messages: [...decision.messages, noticeMessage(parts.join('\n'))] }
   })
 
   // The masks live on the agents' own scopes, not on this plugin's, so the

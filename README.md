@@ -26,6 +26,13 @@ question written into a reply is not delivered as one: the round ends, the drive
 round, and the question survives only as prose. So both texts gain an **ask rule** — call
 `ask_user_question` and wait for the answer — appended exactly where that tool resolves.
 
+It also gives a long round a way to make room for itself. A goal can outgrow its context window before
+it reaches its objective, and the harness's `/compact` command is human-driven while `compactNow()`
+requires an idle agent — neither is reachable from a tool call, which always runs inside an open turn.
+The row publishes `compact_context` and names it in the per-round notice: the model can replace a
+balanced prefix of its own history with a summary and continue from there, keeping a recent tail. The
+nudge appears only where the tool, a compaction backend, and the token meter all resolve.
+
 ## What it does
 
 | Contribution | Where it lands | When |
@@ -34,6 +41,8 @@ round, and the question survives only as prose. So both texts gain an **ask rule
 | A short notice | The **first step** of a goal round, after the `<goal_round>` message | Once per round |
 | A tool mask | `get_goal` / `create_goal` / `update_goal` on each agent's own scope | While that agent holds no goal, and again once its goal is `complete` |
 | An ask rule | Appended to whichever of the two texts the scope gets | Only while that scope can call `ask_user_question` |
+| A compaction tool | The global tool layer as `compact_context` | Whenever the row is mounted and `compactEnabled` is true |
+| A compaction nudge | Appended to the per-round notice | Only while the tool, a compaction backend, and the token meter resolve for that agent |
 
 The paragraph sets the standing rule: earlier rounds' tool results are accumulated evidence rather
 than narration to re-derive, inspect only what a change could have invalidated, decide the round's
@@ -98,6 +107,36 @@ cannot close the goal itself.
 The rule rides in the same notice message and the same text block as the discipline notice, as a
 second `<goal_round_ask>` block, so a round still records exactly one notice.
 
+### The compaction tool
+
+A tool call always runs inside an open turn, so the two obvious entries do not fit: `/compact` is a
+human command, and `compactNow()` reserves the agent's idle maintenance slot and answers `busy` for an
+active agent. The tool therefore uses `compactRegion()`, the seam's operation for a caller-selected
+surface range, which the contract places inside the open turn that owns the transaction.
+
+The row selects the range itself from the token meter's surface snapshot. It keeps the system head out
+of the range, retains a recent tail (`compactRetainRatio`, 20% of the measured context by default), and
+moves the cut back to a boundary where no tool call is waiting for its result. The backend re-checks
+both edges, so a mismatch fails the call instead of splitting a tool pair.
+
+The call forwards the turn's cancellation signal. An expected failure — no safe range, a backend that
+is already compacting, a summary that is not smaller — comes back as a model-facing result rather than
+an exception, so the round continues with the context it has. The tool is exclusive: the registry does
+not run it beside another call whose result would change the surface while the summary is written. It
+never writes a goal transition; whether the goal is done remains the model's decision.
+
+### The compaction nudge
+
+The nudge is a paragraph of its own appended to the per-round notice, conditional on three composition
+facts: the tool is registered, a compaction backend resolves for the agent, and the token meter
+resolves. A backend may live inside the preset's `isolate` realm, where `agent.ctx.get('compaction')`
+does not see it, so the row asks `agentPresets.serviceFor(agent, 'compaction')` first and falls back to
+the direct service read. A scope with no backend is told nothing about compacting — the same rule the
+ask and goal variants follow.
+
+It is not in the standing system-prompt paragraph because it applies to one moment — a round that has
+grown long — rather than to every request while the goal is active.
+
 ### Why the paragraph is scoped to active goals
 
 The section's text is evaluated per assembly, and the assembly's scope is the Agent. A session that
@@ -132,9 +171,12 @@ Every field lives in [cordis.patch.yml](cordis.patch.yml) or in the row's `confi
 | `askEnabled` | `true` | Append the ask rule where the scope can call `ask_user_question` |
 | `askPolicyText` | built in | The paragraph appended to the discipline paragraph |
 | `askNoticeText` | built in | The `<goal_round_ask>` block appended to the notice |
+| `compactEnabled` | `true` | Publish `compact_context` and append its nudge to the notice |
+| `compactNoticeText` | built in | The `<goal_round_compact>` block appended to the notice |
+| `compactRetainRatio` | `0.2` | Fraction of the measured context kept verbatim below the compacted prefix |
 
 A wrong value fails the row's activation rather than silently disabling half of it: every flag must
-be a boolean and every text a non-empty string.
+be a boolean, every text a non-empty string, and `compactRetainRatio` a number in `(0, 1)`.
 
 ## What it requires from the composition
 
@@ -162,17 +204,29 @@ is what makes the rule reach the model; a UI that answers the question is what m
 the user (the Web and desktop bundles publish both). With `askEnabled: false` the row says nothing
 about asking whatever the composition mounts.
 
+The compaction tool needs a backend and a meter on the agent's side. The backend is whatever
+implementation the session's preset mounts as `compaction` — `@deepseek-ai/dsh-compaction-basic`, a
+profile-provided variant such as `dsh-compaction-threshold/engine`, or another implementation of the
+seam — and the meter is `@deepseek-ai/dsh-token-meter`. A preset that mounts neither still sees the
+tool schema, but the notice never names it, and a direct call reports that compaction is unavailable
+instead of failing the round. The backend is resolved through the preset registry first, because a
+preset's service can publish inside an `isolate` realm where a direct read does not reach it.
+
 ## What the model sees
 
 The notice is one `user/message` per round, carrying `roundNoticeText` as its single text block.
 Its source is `{ kind: 'goal-stop-discipline', form: 'notice' }`; the `notice` form keeps Chat from
 rendering it as a prompt the human typed, so it appears as a collapsed notice in the transcript. A
 scope that can ask carries a second `<goal_round_ask>` block in that same block, not a second
-message.
+message; the same message carries a third `<goal_round_compact>` block where the compaction tool and
+its services resolve.
 
 When the model follows the ask rule, the question is a real `ask_user_question` tool call, so it
 renders as an answerable question in the transcript and the round waits for the reply — the only form
-of question the user is shown.
+of question the user is shown. A `compact_context` call is an ordinary tool call: its result is a
+compact JSON value stating whether anything was replaced, how many history items were shadowed,
+their estimated tokens, and one sentence about what to do next. A failed or empty compaction is
+reported the same way, so it never ends the round.
 
 While the tools are masked, `tool-goal`'s own system-prompt section still describes them. That is
 the harness's paragraph for a tool the composition publishes; a model reads its tool schemas as
@@ -181,9 +235,10 @@ would need this row to shadow another plugin's registration on the agent's scope
 cleverer thing than it is worth.
 
 The row imports nothing from DSH. It runs entirely on the `ctx` its fiber receives — the `agents`,
-`tools`, and `systemPrompt` services and the `agent/created`, `agent/disposed`, `agent/pre-step`, and
-`goal/changed` events — which is why it resolves from any profile without a dependency on the
-harness packages.
+`tools`, and `systemPrompt` services, the `agent/created`, `agent/disposed`, `agent/pre-step`, and
+`goal/changed` events, and optional reads of `agentPresets`, `compaction`, and `tokenMeter` through
+the service store when the compaction tool runs — which is why it resolves from any profile without a
+dependency on the harness packages.
 
 ## When prompt text is not enough
 
@@ -210,7 +265,11 @@ paragraph variant and the callable tools agree in both states, that unloading gi
 that the notice lands exactly once per round with the round's own request series intact, that ordinary
 steps and rejected steps are untouched, that the ask rule is appended to both texts only where
 `ask_user_question` resolves and dropped when `askEnabled` is false, that a scope with the question
-tool but no goal tool still gets it, and every rejected config value:
+tool but no goal tool still gets it, that `compact_context` is published with a registry-ready
+definition, selects a balanced range that keeps the system head, the goal prompt, and the open step,
+calls the backend's `compactRegion` with the caller's signal, reports an empty or failed compaction
+without throwing, disappears with `compactEnabled: false`, and is unregistered with the row, that the
+compact nudge follows the tool, the backend, and the meter, and every rejected config value:
 
 ```sh
 node probe.mjs
@@ -244,7 +303,7 @@ never reaches the running host.
 
 | File | Role |
 |---|---|
-| `index.js` | The row: config validation, active-goal tracking, the section, the notice, the tool mask, and the ask rule |
+| `index.js` | The row: config validation, active-goal tracking, the section, the notice, the tool mask, the ask rule, and the `compact_context` tool with its range selection |
 | `cordis.patch.yml` | The whole package: one inserted row with its config |
 | `package.json` | Bundle manifest (`dsh.bundle.patch`) and the row's export |
-| `probe.mjs` | Offline probe over all four contributions |
+| `probe.mjs` | Offline probe over all contributions |

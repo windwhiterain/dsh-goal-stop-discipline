@@ -21,6 +21,15 @@
 # in the same notice message and paragraph, so it costs no extra message. Set
 # `askEnabled` to false to drop it.
 #
+# `compactEnabled` publishes the model-facing `compact_context` tool, and appends
+# its nudge to the per-round notice only where that tool, a compaction backend,
+# and the token meter all resolve for the agent. The tool replaces a balanced
+# prefix of the session history with a summary while the round is running, so a
+# long goal can make room without waiting for the pressure threshold or for the
+# turn to end. `compactRetainRatio` is the fraction of the measured context kept
+# verbatim below the compacted prefix. Set `compactEnabled` to false to drop both
+# the tool and the nudge.
+#
 # Every text is plain model-facing text: write them as instructions to the agent,
 # and keep any house rule that belongs with them here rather than in the row's
 # code.
@@ -32,3 +41,5 @@
         policyEnabled: true
         roundNoticeEnabled: true
         askEnabled: true
+        compactEnabled: true
+        compactRetainRatio: 0.2
