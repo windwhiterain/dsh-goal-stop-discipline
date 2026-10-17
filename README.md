@@ -32,7 +32,7 @@ round, and the question survives only as prose. So both texts gain an **ask rule
 |---|---|---|
 | A discipline paragraph | The system prompt, right after the goal-tool policy | Only while the assembling agent holds an **active** goal |
 | A short notice | The **first step** of a goal round, after the `<goal_round>` message | Once per round |
-| A tool mask | `get_goal` / `create_goal` / `update_goal` on each agent's own scope | Until that agent holds an active goal, then released |
+| A tool mask | `get_goal` / `create_goal` / `update_goal` on each agent's own scope | While that agent holds no goal, and again once its goal is `complete` |
 | An ask rule | Appended to whichever of the two texts the scope gets | Only while that scope can call `ask_user_question` |
 
 The paragraph sets the standing rule: earlier rounds' tool results are accumulated evidence rather
@@ -59,13 +59,19 @@ scope **inherits** (the global layer and every ancestor layer) and never what it
 registers. The goal tools sit in a host or preset layer above the agent, so they mask cleanly; the
 disposer comes back when the goal appears.
 
-`goal/changed` drives it. A goal that becomes active releases the mask; `complete`, `block`,
-`pause`, and `clear` put it back. An agent whose preset publishes none of the three names gets no
-mask — there is nothing to hide, and `restrict()` rejects unknown names.
+`goal/changed` drives it. The mask is released while the goal is in a phase that `update_goal`
+itself moves the goal out of — `active`, `paused`, and `blocked` — and put back when the goal is
+`complete` (nothing is left to update) or `clear`ed. A mask keyed on `active` alone hid the tool at
+the moment it was needed: a round that reached its objective while the goal had been paused, and a
+goal that had just been blocked, both called a name the registry no longer carried, and dispatch
+answered `unknown tool`. An agent whose preset publishes none of the three names gets no mask —
+there is nothing to hide, and `restrict()` rejects unknown names.
 
 The paragraph and the callable tools stay in agreement because both read the same live registry
 view: while the tools are masked the model is told it has no way to close the goal, and from the
-first round after `/goal create` it is told to call `update_goal`.
+first round after `/goal create` it is told to call `update_goal`. A `paused` or `blocked` goal is the
+one state where the tools outlive the paragraph, because such a goal starts no round for the
+paragraph to steer while `update_goal` is still how the goal moves on.
 
 **`get_goal` is masked and released with `update_goal`, not separately.** A goal round's prompt
 carries the objective and the round number but neither the goal id nor its revision, so a model
@@ -74,7 +80,9 @@ owns goal creation, and an existing goal rejects a second one anyway.
 
 **`pause` and `resume` are not special-cased.** They are part of `update_goal`, and the tool's own
 authority layer rejects them outside a direct human turn — so inside a goal round they stay
-inert, which is correct: an autonomous round completes or blocks, it does not park the goal.
+inert, which is correct: an autonomous round completes or blocks, it does not park the goal. The
+mask now survives both phases for the same reason it survives `blocked`: the tool that would move the
+goal out of them is the one a mask would take away.
 
 ### Why the ask rule is a paragraph, not a fourth variant
 
@@ -114,7 +122,7 @@ Every field lives in [cordis.patch.yml](cordis.patch.yml) or in the row's `confi
 
 | Field | Default | Meaning |
 |---|---|---|
-| `goalToolsOnDemand` | `true` | Mask the goal tools until the agent holds an active goal |
+| `goalToolsOnDemand` | `true` | Mask the goal tools while the agent holds no goal, and once its goal is complete |
 | `policyEnabled` | `true` | Render the discipline paragraph into the system prompt |
 | `policyText` | see the patch | The paragraph, written as instructions to the agent |
 | `policyTextWithoutGoalTools` | see the patch | The same paragraph for a scope that publishes no goal tool |
@@ -196,13 +204,13 @@ already created keeps the cap it was created with — `/goal edit` changes that.
 ## Probes
 
 The offline probe drives `apply()` against fakes and checks when the paragraph renders, that the
-mask is installed at `agent/created` and released by `goal/changed`, that a preset without goal tools
-gets neither mask nor throw, that the paragraph variant and the callable tools agree in both states,
-that unloading gives every mask back, that the notice lands exactly once per round with the round's
-own request series intact, that ordinary steps and rejected steps are untouched, that the ask rule is
-appended to both texts only where `ask_user_question` resolves and dropped when `askEnabled` is
-false, that a scope with the question tool but no goal tool still gets it, and every rejected config
-value:
+mask is installed at `agent/created`, released by `goal/changed` in every phase `update_goal` can act
+on, and put back by `complete`, that a preset without goal tools gets neither mask nor throw, that the
+paragraph variant and the callable tools agree in both states, that unloading gives every mask back,
+that the notice lands exactly once per round with the round's own request series intact, that ordinary
+steps and rejected steps are untouched, that the ask rule is appended to both texts only where
+`ask_user_question` resolves and dropped when `askEnabled` is false, that a scope with the question
+tool but no goal tool still gets it, and every rejected config value:
 
 ```sh
 node probe.mjs

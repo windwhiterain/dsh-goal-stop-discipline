@@ -1,8 +1,10 @@
 # dsh-goal-stop-discipline bundle patch: inserts the discipline row.
 #
 # `goalToolsOnDemand` masks get_goal / create_goal / update_goal on every agent
-# until that agent holds an active goal, then releases the mask as soon as one
-# exists. That needs the tools to be published by the composition in the first
+# while that agent holds no goal, and again once its goal is complete. A paused
+# or blocked goal keeps the tools: `update_goal` is what moves the goal out of
+# those phases, so a mask there removed the tool the round had just been told to
+# call. That needs the tools to be published by the composition in the first
 # place: a preset that mounts no goal tool has nothing to mask. Set
 # `goalToolsOnDemand` to false to leave tool visibility to the composition.
 #

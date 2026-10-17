@@ -40,9 +40,13 @@
  * a preset that mounts no goal tool gives its agents none — while the
  * goal-round driver on the host plane keeps driving that agent's rounds, and its
  * own continuation prompt tells the model to read the goal and mark it
- * complete. The row masks the goal tools on each agent's own scope until that
- * agent holds an active goal, and releases the mask as soon as one exists, so
- * the tools appear for the round that needs them and cost nothing before it.
+ * complete. The row masks the goal tools on each agent's own scope while that
+ * agent holds no goal and while it holds a completed one, and leaves them in
+ * place for every phase in between: a paused or blocked goal is moved out of
+ * that phase by `update_goal` itself, so hiding the tool there made the model
+ * call a name the registry no longer carried and dispatch answered `unknown
+ * tool`. A session that never creates a goal therefore pays nothing for three
+ * schemas, and one whose goal is finished gets the cost back.
  *
  * A fourth contribution covers the other way an autonomous round loses the
  * user. Nothing in the continuation prompt tells the model that a question
@@ -83,14 +87,27 @@ const NOTICE_SUMMARY = 'Goal round: end the run once the objective is met, ask t
 const POLICY_ORDER_OFFSET = 5
 
 /**
- * The model-facing goal tools this row masks until an agent holds an active
- * goal. `get_goal` belongs beside `update_goal` because the continuation prompt
- * carries the objective and the round number but neither the goal id nor its
- * revision, so a model cannot complete a goal without first reading it.
- * `create_goal` stays masked with them: the user owns goal creation, and a goal
- * that already exists rejects a second one anyway.
+ * The model-facing goal tools this row masks while an agent holds no goal and
+ * while it holds a completed one. `get_goal` belongs beside `update_goal`
+ * because the continuation prompt carries the objective and the round number but
+ * neither the goal id nor its revision, so a model cannot complete a goal
+ * without first reading it. `create_goal` stays masked with them: the user owns
+ * goal creation, and a goal that already exists rejects a second one anyway.
  */
 const GOAL_TOOLS = ['get_goal', 'create_goal', 'update_goal']
+
+/**
+ * The phases in which an agent keeps its goal tools.
+ *
+ * Every one of them is a phase `update_goal` itself moves the goal out of, which
+ * is what a mask keyed on `active` alone got wrong: a round that reached its
+ * objective, or a goal the office or the user had paused, saw the tool disappear
+ * from its own scope and dispatch answered `unknown tool` for the call the round
+ * prompt had just asked for. `complete` is absent because nothing is left to
+ * update once the goal is closed, so the mask returns and the request stops
+ * paying for the schemas.
+ */
+const KEEPS_GOAL_TOOLS = new Set(['active', 'paused', 'blocked'])
 
 /**
  * The question tool the ask rule names. Whether a scope can call it is a
@@ -257,8 +274,13 @@ function noticeMessage(text) {
 export function apply(ctx, raw) {
   const config = resolveConfig(raw)
 
-  /** Agents whose current goal is active; the WeakSet keeps disposed agents collectable. */
-  const active = new WeakSet()
+  /**
+   * The last phase seen for each agent; the WeakMap keeps disposed agents collectable.
+   *
+   * An agent with no entry holds no goal, which is the same state as a cleared
+   * one, so the mask needs no third state.
+   */
+  const phases = new WeakMap()
 
   /** Live goal-tool masks, keyed by agent so a goal's end can give them back. */
   const gates = new Map()
@@ -273,7 +295,7 @@ export function apply(ctx, raw) {
    * @param agent - the agent to mask.
    */
   function maskGoalTools(agent) {
-    if (!config.goalToolsOnDemand || gates.has(agent) || active.has(agent)) return
+    if (!config.goalToolsOnDemand || gates.has(agent) || KEEPS_GOAL_TOOLS.has(phases.get(agent))) return
     const visible = ctx.tools.schemas(agent).map(schema => schema.name)
     const names = GOAL_TOOLS.filter(tool => visible.includes(tool))
     if (names.length === 0) return
@@ -281,7 +303,8 @@ export function apply(ctx, raw) {
   }
 
   /**
-   * Give one agent's goal tools back, once its goal exists or the row unloads.
+   * Give one agent's goal tools back, while its goal is in a phase `update_goal`
+   * moves it out of, and again when the row unloads.
    * @param agent - the agent to unmask.
    */
   function unmaskGoalTools(agent) {
@@ -290,18 +313,18 @@ export function apply(ctx, raw) {
   }
 
   /**
-   * Whether this agent currently holds an active goal.
+   * The phase of the goal one live agent holds.
    * @param agent - the live agent owning the goal.
-   * @returns whether the goal service reports an active goal.
+   * @returns the phase the goal service reports, or undefined when it holds none.
    */
-  function hasActiveGoal(agent) {
+  function goalPhase(agent) {
     try {
-      return ctx.get('goals')?.get(agent)?.phase === 'active'
+      return ctx.get('goals')?.get(agent)?.phase
     } catch (error) {
       // The goal service rejects an agent it no longer lists as live; a goal
       // registry failure leaves this row silent rather than breaking a turn.
       ctx.logger.warn(`dsh-goal-stop-discipline: could not read the goal of "${agent.id}": ${error instanceof Error ? error.message : String(error)}`)
-      return false
+      return undefined
     }
   }
 
@@ -327,28 +350,24 @@ export function apply(ctx, raw) {
     return agent !== undefined && ctx.tools.get(ASK_TOOL, agent) !== undefined
   }
 
-  // A goal that already existed when this row loaded is adopted here; goals
-  // created later arrive through `goal/changed`. Every live agent is masked
-  // first, so a goal adopted above never leaves its tools masked.
+  // A goal that already existed when this row loaded is adopted here, phase and
+  // all; goals created later arrive through `goal/changed`. The phase is read
+  // once per live agent, so a goal that keeps its tools never starts masked.
   for (const agent of ctx.agents.list()) {
+    phases.set(agent, goalPhase(agent))
     maskGoalTools(agent)
-    if (hasActiveGoal(agent)) {
-      active.add(agent)
-      unmaskGoalTools(agent)
-    }
   }
 
   ctx.on('agent/created', ({ agent }) => { maskGoalTools(agent) })
   ctx.on('agent/disposed', ({ agent }) => { unmaskGoalTools(agent); gates.delete(agent) })
 
   ctx.on('goal/changed', ({ agent, change }) => {
-    if (change.goal?.phase === 'active') {
-      active.add(agent)
-      unmaskGoalTools(agent)
-    } else {
-      active.delete(agent)
-      maskGoalTools(agent)
-    }
+    // A `clear` carries no goal, which leaves the phase undefined and the mask
+    // in place — the same state as an agent that never had one.
+    const phase = change.goal?.phase
+    phases.set(agent, phase)
+    if (KEEPS_GOAL_TOOLS.has(phase)) unmaskGoalTools(agent)
+    else maskGoalTools(agent)
   })
 
   if (config.policyEnabled) {
@@ -356,10 +375,12 @@ export function apply(ctx, raw) {
       name: SECTION_NAME,
       order: ctx.systemPrompt.getSectionOrder('TOOL_GOAL') + POLICY_ORDER_OFFSET,
       // The assembly scope is the agent, so a session that never created a goal
-      // assembles an empty section instead of carrying the paragraph.
+      // assembles an empty section instead of carrying the paragraph. Only an
+      // active goal renders it: a paused or blocked one starts no round for the
+      // paragraph to steer.
       text: context => {
         const scope = context.scope
-        if (scope === undefined || !active.has(scope)) return ''
+        if (scope === undefined || phases.get(scope) !== 'active') return ''
         const paragraph = canCloseGoal(scope)
           ? config.policyText
           : config.policyTextWithoutGoalTools

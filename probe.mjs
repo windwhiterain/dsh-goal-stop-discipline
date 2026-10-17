@@ -225,6 +225,29 @@ async function main() {
     assert.ok(!canCall(agent, 'create_goal'))
   })
 
+  check('keeps the goal tools while update_goal is what moves the goal on', () => {
+    for (const phase of ['paused', 'blocked']) {
+      const harness = mount()
+      const agent = fakeAgent(`agent-${phase}`)
+      harness.ctx.listeners.get('agent/created')({ agent })
+      harness.change(agent, { phase })
+      assert.ok(canCall(agent, 'update_goal'), `a ${phase} goal keeps the tool that ends that phase`)
+      assert.ok(canCall(agent, 'get_goal'))
+      harness.change(agent, { phase: 'active' })
+      assert.ok(canCall(agent, 'update_goal'), `resuming a ${phase} goal keeps them`)
+    }
+  })
+
+  check('masks a goal that is cleared after having been active', () => {
+    const harness = mount()
+    const agent = fakeAgent('agent-cleared')
+    harness.ctx.listeners.get('agent/created')({ agent })
+    harness.change(agent, { phase: 'active' })
+    // `clear` carries no goal, which the fake's `change` helper cannot express.
+    harness.ctx.listeners.get('goal/changed')({ agent, change: { operation: 'clear' } })
+    assert.ok(!canCall(agent, 'update_goal'), 'a cleared goal leaves no tool behind')
+  })
+
   check('keeps the paragraph and the callable tools in agreement', () => {
     const harness = mount()
     const agent = fakeAgent()
